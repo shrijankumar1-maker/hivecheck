@@ -1,100 +1,188 @@
-# .github/workflows/pipeline.yml
-# Run the tests on every pull request and on every push to main.
-# After a push to main, deploy to production if the tests passed.
 name: Pipeline
 
 on:
   pull_request:
   push:
-    branches: [main]
+    branches:
+      - main
   workflow_dispatch:
 
-# The default for every job. A job that needs more asks for it itself.
 permissions:
   contents: read
+  checks: write
 
 jobs:
   test:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      checks: write             # the test results appear as a check of their own
-      pull-requests: write      # and as a comment on the pull request
-    steps:
-      - name: Check out the code
-        uses: actions/checkout@v7
 
-      - name: Set up Python
-        uses: actions/setup-python@v7
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-          cache: pip
-          cache-dependency-path: requirements*.txt
 
       - name: Install dependencies
-        run: pip install -r requirements.txt -r requirements-dev.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
 
-      - name: Run the tests
-        run: python -m pytest -v --junitxml=test-results.xml
+      - name: Run tests
+        run: |
+          python -m pytest -v --junitxml=test-results.xml
 
-      - name: Publish the test results
-        if: ${{ !cancelled() }}
-        uses: EnricoMi/publish-unit-test-result-action@v2
+      - name: Test Results
+        if: ${{ always() }}
+        uses: dorny/test-reporter@v2
         with:
-          files: test-results.xml
+          name: Test Results
+          path: test-results.xml
+          reporter: java-junit
 
-  deploy:
-    needs: test
-    if: github.event_name != 'pull_request'     # never from a pull request
+  model-gate:
     runs-on: ubuntu-latest
-    # id-token: write lets the job ask GitHub for an OIDC token,
-    # which AWS trades for short-lived credentials.
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Take main model as baseline
+        run: |
+          git fetch --depth=1 origin main
+          mkdir -p /tmp/baseline
+          git show FETCH_HEAD:model/model.json > /tmp/baseline/model.json
+
+      - name: Run model-quality gate
+        run: |
+          python gate.py /tmp/baseline model
+
+  staging:
+    needs:
+      - test
+      - model-gate
+
+    if: github.ref == 'refs/heads/main'
+
+    runs-on: ubuntu-latest
+
+    environment: staging
+
     permissions:
       id-token: write
       contents: read
-    env:
-      AWS_REGION: us-west-2
-      ECR_REPOSITORY: hivecheck
-      ECS_CLUSTER: hivecheck-production
-      ECS_SERVICE: hivecheck-api
-      TASK_FAMILY: hivecheck-production
-      CONTAINER_NAME: hivecheck
-    steps:
-      - name: Check out the code
-        uses: actions/checkout@v7
 
-      - name: Get AWS credentials
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-region: us-west-2
           mask-aws-account-id: true
 
-      - name: Log in to Amazon ECR
-        id: ecr
+      - name: Login to Amazon ECR
+        id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and push the image
-        id: image
+      - name: Build and push image
+        id: build-image
         env:
-          IMAGE: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
         run: |
-          docker build --build-arg GIT_SHA=${{ github.sha }} -t "$IMAGE" .
-          docker push "$IMAGE"
-          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          docker build \
+            --build-arg GIT_SHA="${IMAGE_TAG}" \
+            -t "${REGISTRY}/hivecheck:${IMAGE_TAG}" \
+            .
 
-      - name: Put the new image into the task definition
-        id: render
+          docker push "${REGISTRY}/hivecheck:${IMAGE_TAG}"
+
+          echo "image=${REGISTRY}/hivecheck:${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Render staging task definition
+        id: render-task-definition
         uses: aws-actions/amazon-ecs-render-task-definition@v1
         with:
-          task-definition-family: ${{ env.TASK_FAMILY }}
-          container-name: ${{ env.CONTAINER_NAME }}
-          image: ${{ steps.image.outputs.image }}
+          task-definition: infra/task-definition-staging.json
+          container-name: hivecheck
+          image: ${{ steps.build-image.outputs.image }}
 
-      - name: Deploy to production
+      - name: Deploy staging
         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
         with:
-          task-definition: ${{ steps.render.outputs.task-definition }}
-          cluster: ${{ env.ECS_CLUSTER }}
-          service: ${{ env.ECS_SERVICE }}
+          task-definition: ${{ steps.render-task-definition.outputs.task-definition }}
+          service: hivecheck-api
+          cluster: hivecheck-staging
           wait-for-service-stability: true
+
+      - name: Smoke test staging
+        run: |
+          python smoke_test.py \
+            "$(bash infra/service-url.sh staging)" \
+            "${{ github.sha }}"
+
+  production:
+    needs: staging
+
+    runs-on: ubuntu-latest
+
+    environment: production
+
+    concurrency: production
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-west-2
+          mask-aws-account-id: true
+
+      - name: Find image
+        id: image
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          URI=$(aws ecr describe-repositories \
+            --repository-names hivecheck \
+            --query 'repositories[0].repositoryUri' \
+            --output text)
+
+          aws ecr describe-images \
+            --repository-name hivecheck \
+            --image-ids "imageTag=${SHA}" \
+            >/dev/null
+
+          echo "image=${URI}:$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Render production task definition
+        id: render-task-definition
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: infra/task-definition-production.json
+          container-name: hivecheck
+          image: ${{ steps.image.outputs.image }}
+
+      - name: Deploy production
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-task-definition.outputs.task-definition }}
+          service: hivecheck-api
+          cluster: hivecheck-production
+          wait-for-service-stability: true
+
+      - name: Smoke test production
+        run: |
+          python smoke_test.py \
+            "$(bash infra/service-url.sh production)" \
+            "${{ github.sha }}"
