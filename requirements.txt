@@ -1,0 +1,5 @@
+# What the service needs to run. Every version is exact, so two images built
+# from the same commit a month apart hold the same packages.
+fastapi==0.141.1
+pydantic==2.13.5
+uvicorn==0.53.0

@@ -1,0 +1,100 @@
+# .github/workflows/pipeline.yml
+# Run the tests on every pull request and on every push to main.
+# After a push to main, deploy to production if the tests passed.
+name: Pipeline
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# The default for every job. A job that needs more asks for it itself.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write             # the test results appear as a check of their own
+      pull-requests: write      # and as a comment on the pull request
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run the tests
+        run: python -m pytest -v --junitxml=test-results.xml
+
+      - name: Publish the test results
+        if: ${{ !cancelled() }}
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        with:
+          files: test-results.xml
+
+  deploy:
+    needs: test
+    if: github.event_name != 'pull_request'     # never from a pull request
+    runs-on: ubuntu-latest
+    # id-token: write lets the job ask GitHub for an OIDC token,
+    # which AWS trades for short-lived credentials.
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      AWS_REGION: us-west-2
+      ECR_REPOSITORY: hivecheck
+      ECS_CLUSTER: hivecheck-production
+      ECS_SERVICE: hivecheck-api
+      TASK_FAMILY: hivecheck-production
+      CONTAINER_NAME: hivecheck
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v7
+
+      - name: Get AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push the image
+        id: image
+        env:
+          IMAGE: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+        run: |
+          docker build --build-arg GIT_SHA=${{ github.sha }} -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Put the new image into the task definition
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition-family: ${{ env.TASK_FAMILY }}
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.image.outputs.image }}
+
+      - name: Deploy to production
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          service: ${{ env.ECS_SERVICE }}
+          wait-for-service-stability: true
