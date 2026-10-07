@@ -1,4 +1,5 @@
 # hivecheck
+New branch got added
 
 Flags beehives at risk of colony collapse from their weekly sensor readings.
 
