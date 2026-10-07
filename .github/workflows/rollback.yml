@@ -51,18 +51,38 @@ jobs:
 
           echo "image=${URI}:${SHA}" >> "$GITHUB_OUTPUT"
 
+      - name: Get production task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition hivecheck-production \
+            --query 'taskDefinition' \
+            --output json \
+            > /tmp/task-definition-production.json
+
+          jq 'del(
+            .taskDefinitionArn,
+            .revision,
+            .status,
+            .requiresAttributes,
+            .compatibilities,
+            .registeredAt,
+            .registeredBy
+          )' \
+            /tmp/task-definition-production.json \
+            > /tmp/task-definition-production-clean.json
+
       - name: Render production task definition
-        id: render-task-definition
+        id: render-production-task-definition
         uses: aws-actions/amazon-ecs-render-task-definition@v1
         with:
-          task-definition: infra/task-definition-production.json
+          task-definition: /tmp/task-definition-production-clean.json
           container-name: hivecheck
           image: ${{ steps.image.outputs.image }}
 
       - name: Deploy rollback
         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
         with:
-          task-definition: ${{ steps.render-task-definition.outputs.task-definition }}
+          task-definition: ${{ steps.render-production-task-definition.outputs.task-definition }}
           service: hivecheck-api
           cluster: hivecheck-production
           wait-for-service-stability: true
