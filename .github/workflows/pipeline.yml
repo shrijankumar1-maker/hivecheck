@@ -103,18 +103,38 @@ jobs:
 
           echo "image=${REGISTRY}/hivecheck:${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
 
+      - name: Get staging task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition hivecheck-staging \
+            --query 'taskDefinition' \
+            --output json \
+            > /tmp/task-definition-staging.json
+
+          jq 'del(
+            .taskDefinitionArn,
+            .revision,
+            .status,
+            .requiresAttributes,
+            .compatibilities,
+            .registeredAt,
+            .registeredBy
+          )' \
+            /tmp/task-definition-staging.json \
+            > /tmp/task-definition-staging-clean.json
+
       - name: Render staging task definition
-        id: render-task-definition
+        id: render-staging-task-definition
         uses: aws-actions/amazon-ecs-render-task-definition@v1
         with:
-          task-definition: infra/task-definition-staging.json
+          task-definition: /tmp/task-definition-staging-clean.json
           container-name: hivecheck
           image: ${{ steps.build-image.outputs.image }}
 
       - name: Deploy staging
         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
         with:
-          task-definition: ${{ steps.render-task-definition.outputs.task-definition }}
+          task-definition: ${{ steps.render-staging-task-definition.outputs.task-definition }}
           service: hivecheck-api
           cluster: hivecheck-staging
           wait-for-service-stability: true
@@ -163,20 +183,40 @@ jobs:
             --image-ids "imageTag=${SHA}" \
             >/dev/null
 
-          echo "image=${URI}:$SHA" >> "$GITHUB_OUTPUT"
+          echo "image=${URI}:${SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Get production task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition hivecheck-production \
+            --query 'taskDefinition' \
+            --output json \
+            > /tmp/task-definition-production.json
+
+          jq 'del(
+            .taskDefinitionArn,
+            .revision,
+            .status,
+            .requiresAttributes,
+            .compatibilities,
+            .registeredAt,
+            .registeredBy
+          )' \
+            /tmp/task-definition-production.json \
+            > /tmp/task-definition-production-clean.json
 
       - name: Render production task definition
-        id: render-task-definition
+        id: render-production-task-definition
         uses: aws-actions/amazon-ecs-render-task-definition@v1
         with:
-          task-definition: infra/task-definition-production.json
+          task-definition: /tmp/task-definition-production-clean.json
           container-name: hivecheck
           image: ${{ steps.image.outputs.image }}
 
       - name: Deploy production
         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
         with:
-          task-definition: ${{ steps.render-task-definition.outputs.task-definition }}
+          task-definition: ${{ steps.render-production-task-definition.outputs.task-definition }}
           service: hivecheck-api
           cluster: hivecheck-production
           wait-for-service-stability: true
