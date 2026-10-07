@@ -1,0 +1,74 @@
+name: Roll back production
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Full commit SHA of the earlier production release"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+
+    environment: production
+
+    concurrency: production
+
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      SHA: ${{ inputs.sha }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-west-2
+          mask-aws-account-id: true
+
+      - name: Find rollback image
+        id: image
+        run: |
+          URI=$(aws ecr describe-repositories \
+            --repository-names hivecheck \
+            --query 'repositories[0].repositoryUri' \
+            --output text)
+
+          aws ecr describe-images \
+            --repository-name hivecheck \
+            --image-ids "imageTag=${SHA}" \
+            >/dev/null
+
+          echo "image=${URI}:${SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Render production task definition
+        id: render-task-definition
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: infra/task-definition-production.json
+          container-name: hivecheck
+          image: ${{ steps.image.outputs.image }}
+
+      - name: Deploy rollback
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-task-definition.outputs.task-definition }}
+          service: hivecheck-api
+          cluster: hivecheck-production
+          wait-for-service-stability: true
+
+      - name: Smoke test production
+        run: |
+          python smoke_test.py \
+            "$(bash infra/service-url.sh production)" \
+            "$SHA"
